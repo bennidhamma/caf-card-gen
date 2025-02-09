@@ -38,6 +38,11 @@ const DEFAULT_STYLES: TextStyles = {
     boldColor: '#c68411'
 };
 
+interface TextBlock {
+    type: 'h2' | 'paragraph' | 'bullet';
+    content: Array<{ text: string; isBold: boolean }>;
+}
+
 class CardGenerator {
     private template: string = '';
     private $: ReturnType<typeof load> | null = null;
@@ -67,12 +72,53 @@ class CardGenerator {
         });
     }
 
-    private processTitle(title: string): string {
-        return title.toUpperCase();
+    private parseMarkdownToBlocks(text: string): TextBlock[] {
+        const blocks: TextBlock[] = [];
+        const lines = text.split('\n');
+        let currentParagraph: string[] = [];
+
+        const flushParagraph = () => {
+            if (currentParagraph.length > 0) {
+                blocks.push({
+                    type: 'paragraph',
+                    content: this.parseInlineFormatting(currentParagraph.join(' '))
+                });
+                currentParagraph = [];
+            }
+        };
+
+        lines.forEach(line => {
+            const trimmedLine = line.trim();
+            
+            if (trimmedLine.startsWith('## ')) {
+                // Header
+                flushParagraph();
+                blocks.push({
+                    type: 'h2',
+                    content: this.parseInlineFormatting(trimmedLine.slice(3))
+                });
+            } else if (trimmedLine.startsWith('* ')) {
+                // Bullet point
+                flushParagraph();
+                blocks.push({
+                    type: 'bullet',
+                    content: this.parseInlineFormatting(trimmedLine.slice(2))
+                });
+            } else if (trimmedLine === '') {
+                // Empty line
+                flushParagraph();
+            } else {
+                // Part of a paragraph
+                currentParagraph.push(trimmedLine);
+            }
+        });
+
+        flushParagraph(); // Don't forget the last paragraph
+        return blocks;
     }
 
-    private processBacktext(text: string): { spans: Array<{ text: string, isBold: boolean }> } {
-        const segments: Array<{ text: string, isBold: boolean }> = [];
+    private parseInlineFormatting(text: string): Array<{ text: string; isBold: boolean }> {
+        const segments: Array<{ text: string; isBold: boolean }> = [];
         let currentIndex = 0;
 
         const boldPattern = /(\*\*|__)(.*?)\1/g;
@@ -101,60 +147,132 @@ class CardGenerator {
             });
         }
 
-        return { spans: segments };
+        return segments;
     }
 
-    private createSVGTextSpans($container: cheerio.Cheerio, 
-                              segments: Array<{ text: string, isBold: boolean }>,
-                              baseY: number): void {
-        if (!this.$) throw new Error('Template not loaded');
-        
-        let currentX = 0;
-        const lineHeight = 20;
-        let currentY = baseY;
-        let currentLine = '';
-        const maxWidth = 280;
+private createTextContent($textElement: cheerio.Cheerio, blocks: TextBlock[]) {
+    if (!this.$) throw new Error('Template not loaded');
 
-        segments.forEach(segment => {
-            const words = segment.text.split(' ');
-            
-            words.forEach(word => {
-                const wordWidth = word.length * 6;
-                
-                if (currentX + wordWidth > maxWidth) {
-                    const $tspan = this.$!('<tspan>')
-                        .attr('x', '0')
-                        .attr('y', currentY.toString())
-                        .text(currentLine.trim());
-                    
-                    $container.append($tspan);
-                    
-                    currentY += lineHeight;
-                    currentLine = '';
-                    currentX = 0;
+    // Clear existing content
+    $textElement.empty();
+
+    // Get basic text properties from the template
+    const baseX = Number($textElement.attr('x') || '3');
+    const baseY = Number($textElement.attr('y') || '21');
+    
+    // Extract font size from the style attribute or font-size attribute
+    const styleAttr = $textElement.attr('style') || '';
+    const fontSizeMatch = styleAttr.match(/font-size:([\d.]+)px/);
+    const fontSize = fontSizeMatch 
+        ? Number(fontSizeMatch[1])
+        : Number($textElement.attr('font-size') || '8.46667');
+
+    console.log('Using font size:', fontSize); // Debug log
+
+    const lineHeight = fontSize * 1.2;
+    const maxWidth = 120 * 1.2;
+    const avgCharWidth = fontSize * 0.5;
+
+    // Helper to estimate text width
+    const estimateWidth = (text: string) => text.length * avgCharWidth;
+
+    // Helper to create a new line tspan
+    const createLineTspan = (
+        atY: number,
+        blockType: TextBlock['type'],
+        includesBullet: boolean = false
+    ) => {
+        const $line = this.$!('<tspan>')
+            .attr('x', String(blockType === 'bullet' ? baseX + 5 : baseX))
+            .attr('y', String(atY));
+
+        switch (blockType) {
+            case 'h2':
+                $line
+                    .attr('font-weight', 'bold')
+                    .attr('text-anchor', 'middle')
+                    .attr('x', String(baseX + maxWidth / 2));
+                break;
+            case 'paragraph':
+                $line
+                    .attr('text-anchor', 'middle')
+                    .attr('x', String(baseX + maxWidth / 2));
+                break;
+            case 'bullet':
+                $line.attr('text-anchor', 'start');
+                if (includesBullet) {
+                    this.$!('<tspan>').text('• ').appendTo($line);
                 }
-                
-                currentLine += (currentX === 0 ? '' : ' ') + word;
-                currentX += wordWidth + 6;
-            });
+                break;
+        }
+        return $line;
+    };
 
-            const $tspan = this.$!('<tspan>')
-                .attr('x', '0')
-                .attr('y', currentY.toString());
+    let currentY = baseY + fontSize; // Start with space for the first line
+    let firstInBlock = true;
+
+    blocks.forEach(block => {
+        if (!firstInBlock) {
+            // Add extra spacing between blocks
+            currentY += lineHeight * (block.type === 'bullet' ? 0.3 : 0.6);
+        }
+        firstInBlock = false;
+
+        let currentLine: Array<cheerio.Cheerio> = [];
+        let currentLineWidth = 0;
+        let linesInCurrentBlock = 0;
+        let $currentTspan = createLineTspan(currentY, block.type, true);
+
+        // Process each content segment
+        block.content.forEach(segment => {
+            const words = segment.text.split(/\s+/);
             
-            if (segment.isBold) {
-                $tspan.attr('fill', this.styles.boldColor)
-                     .attr('font-weight', 'bold');
-            }
-            
-            $tspan.text(currentLine.trim());
-            $container.append($tspan);
-            
-            currentLine = '';
-            currentX = 0;
-            currentY += lineHeight;
+            words.forEach((word, wordIndex) => {
+                const wordWidth = estimateWidth(word);
+                const spaceWidth = estimateWidth(' ');
+                const isFirstWord = wordIndex === 0 && currentLine.length === 0;
+                
+                // Check if we need to start a new line
+                if (!isFirstWord && currentLineWidth + wordWidth + spaceWidth > maxWidth) {
+                    // Append current line to the text element
+                    $textElement.append($currentTspan);
+                    
+                    // Start new line
+                    linesInCurrentBlock++;
+                    currentY += lineHeight;
+                    $currentTspan = createLineTspan(currentY, block.type);
+                    currentLine = [];
+                    currentLineWidth = 0;
+                }
+
+                // Add space between words if needed
+                if (!isFirstWord) {
+                    this.$!('<tspan>').text(' ').appendTo($currentTspan);
+                    currentLineWidth += spaceWidth;
+                }
+
+                // Add the word with proper formatting
+                const $wordSpan = this.$!('<tspan>');
+                if (segment.isBold) {
+                    $wordSpan
+                        .attr('fill', this.styles.boldColor)
+                        .attr('font-weight', 'bold');
+                }
+                $wordSpan.text(word);
+                $currentTspan.append($wordSpan);
+                
+                currentLine.push($wordSpan);
+                currentLineWidth += wordWidth;
+            });
         });
-    }
+
+        // Don't forget to append the last line
+        if ($currentTspan) {
+            $textElement.append($currentTspan);
+            currentY += lineHeight;  // Account for the height of the last line
+        }
+    });
+}
 
     generateCard(data: CardData): string {
         if (!this.$) throw new Error('Template not loaded');
@@ -163,16 +281,16 @@ class CardGenerator {
 
         if (data.title) {
             const $titleElement = $(this.selectors.title);
-            $titleElement.text(this.processTitle(data.title));
-            $titleElement.attr('fill', this.styles.titleBgColor);
+            $titleElement
+                .text(data.title.toUpperCase())
+                .attr('fill', this.styles.titleBgColor);
+            // Keep existing text-anchor and positioning from template
         }
 
         if (data.backtext) {
             const $backtextElement = $(this.selectors.backtext);
-            const processedText = this.processBacktext(data.backtext);
-            
-            $backtextElement.empty();
-            this.createSVGTextSpans($backtextElement, processedText.spans, 0);
+            const blocks = this.parseMarkdownToBlocks(data.backtext);
+            this.createTextContent($backtextElement, blocks);
         }
 
         if (data.photo_url && this.selectors.photo) {
